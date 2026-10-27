@@ -1,0 +1,2 @@
+package { name = "wav-portable", version = "0.0.1", sysl = "0.7.0" }
+dependencies { wav { workspace = true } }

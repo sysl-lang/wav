@@ -1,0 +1,3 @@
+package { name = "wav", version = "0.1.0", sysl = "0.7.0" }
+optimization = "2"
+workspace = ["tools/*"]

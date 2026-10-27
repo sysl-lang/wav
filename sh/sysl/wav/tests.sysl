@@ -1,0 +1,144 @@
+module sh.sysl.wav
+@tests
+
+private struct Memory
+    bytes: [2048]u8
+    length: usize
+    step: usize
+    fail_at: u64
+    zero: bool
+    sync_error: bool
+    synced: bool
+private memory(step: usize = 2048) -> Memory = Memory([0;2048],0,step,0xffffffffffffffff,false,false,false)
+impl Source for Memory
+    size(self) -> Result[u64,Error] = Ok(u64(self.length))
+    read_at(*self, offset: u64, out: []u8) -> Result[usize,Error]
+        if offset >= self.fail_at then return Err(Error.Io)
+        if offset >= u64(self.length) || self.zero then return Ok(0)
+        val at = usize(offset)
+        var count = if out.len < self.length - at then out.len else self.length - at
+        if count > self.step then count = self.step
+        for i in 0..<count do out[i] = self.bytes[at + i]
+        Ok(count)
+impl Sink for Memory
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize,Error]
+        if offset >= self.fail_at then return Err(Error.Io)
+        if self.zero then return Ok(0)
+        if offset > u64(self.bytes.len) then return Err(Error.Io)
+        val at = usize(offset)
+        var count = if bytes.len < self.bytes.len - at then bytes.len else self.bytes.len - at
+        if count > self.step then count = self.step
+        if u64(at + count) > self.fail_at then count = usize(self.fail_at) - at
+        for i in 0..<count do self.bytes[at + i] = bytes[i]
+        if at + count > self.length then self.length = at + count
+        Ok(count)
+    sync(*self) -> Result[unit,Error]
+        if self.sync_error then return Err(Error.Io)
+        self.synced = true
+        Ok(())
+
+@test("WAV: all encodings and mono/stereo/multichannel stream with partial I/O and frame seeking")
+formats()
+    for encoding in [Encoding.Pcm8,Encoding.Pcm16,Encoding.Pcm24,Encoding.Pcm32,Encoding.Float32]
+        for channels in [1u16,2u16,6u16]
+            var stream = memory(3)
+            val f = format(48000,channels,encoding,if channels == 6 then 63 else 0)
+            var w = writer(&stream,f).unwrap()
+            var data: [72]u8 = [0;72]
+            val count = usize(block_align(f)) * 3
+            for i in 0..<count do data[i] = u8(i * 17)
+            w.append(&stream,data[..<count]).unwrap()
+            assert(w.frames() == 3)
+            w.finish(&stream).unwrap()
+            assert(stream.synced)
+            w.finish(&stream).unwrap()
+            assert(w.append(&stream,[]).err() == Some(Error.State))
+            val info = inspect(&stream).unwrap()
+            assert(info.format == f && info.frames == 3 && info.data_bytes == u32(count))
+            assert(stream.length == header_size(f) + count + (count & 1))
+            var r = reader(&stream).unwrap()
+            var out: [72]u8 = [0;72]
+            assert(r.read(&stream,out[..<count]).unwrap() == count)
+            for i in 0..<count do assert(out[i] == data[i])
+            assert(r.read(&stream,out[..<count]).unwrap() == 0)
+            r.seek_frame(1).unwrap()
+            assert(r.read(&stream,out[..<count]).unwrap() == count * 2 / 3)
+            assert(out[0] == data[usize(block_align(f))])
+            assert(r.seek_frame(4).err() == Some(Error.InvalidBuffer))
+            if block_align(f) > 1 then assert(r.read(&stream,out[..<1]).err() == Some(Error.InvalidBuffer))
+
+@test("WAV: PCM16 header matches independent canonical RIFF bytes")
+golden_header()
+    var bytes: [80]u8 = [0;80]
+    assert(header(format(48000,2,Encoding.Pcm16),2,bytes[..]).unwrap() == 44)
+    val expected: [44]u8 = [82,73,70,70,44,0,0,0,87,65,86,69,102,109,116,32,16,0,0,0,1,0,2,0,128,187,0,0,0,238,2,0,4,0,16,0,100,97,116,97,8,0,0,0]
+    for i in 0..<44 do assert(bytes[i] == expected[i])
+    assert(header(format(0,2,Encoding.Pcm16),0,bytes[..]).err() == Some(Error.InvalidFormat))
+    assert(header(format(48000,0,Encoding.Pcm16),0,bytes[..]).is_err())
+    assert(header(format(48000,65535,Encoding.Pcm32),0,bytes[..]).is_err())
+    assert(header(format(0xffffffff,2,Encoding.Pcm16),0,bytes[..]).is_err())
+    assert(header(format(48000,2,Encoding.Pcm16,1),0,bytes[..]).is_err())
+    assert(header(format(48000,2,Encoding.Pcm16),0,bytes[..<43]).err() == Some(Error.InvalidBuffer))
+    assert(header(format(48000,2,Encoding.Pcm16),0xffffffffffffffff,bytes[..]).err() == Some(Error.TooLarge))
+    assert(header(format(1,1,Encoding.Pcm8),4294967258,bytes[..]).is_ok())
+    assert(header(format(1,1,Encoding.Pcm8),4294967259,bytes[..]).err() == Some(Error.TooLarge))
+
+@test("WAV: unknown odd chunks, data before fmt, truncation, alignment, duplicate chunks and unsupported codecs")
+chunk_validation()
+    var stream = memory()
+    var header_bytes: [80]u8
+    header(format(48000,2,Encoding.Pcm16),1,header_bytes[..]).unwrap()
+    // Independent layout: RIFF/WAVE + JUNK(1)+pad + data(4) + fmt(16).
+    val prefix: [22]u8 = [82,73,70,70,50,0,0,0,87,65,86,69,74,85,78,75,1,0,0,0,7,0]
+    for i in 0..<22 do stream.bytes[i] = prefix[i]
+    for i in 0..<8 do stream.bytes[22 + i] = header_bytes[36 + i]
+    for i in 0..<24 do stream.bytes[34 + i] = header_bytes[12 + i]
+    stream.length = 58
+    val info = inspect(&stream).unwrap()
+    assert(info.data_offset == 30 && info.frames == 1)
+    stream.length = 57
+    assert(inspect(&stream).err() == Some(Error.Truncated))
+    stream.length = 58
+    stream.bytes[26] = 3
+    assert(inspect(&stream).err() == Some(Error.InvalidFormat))
+    stream.bytes[26] = 4
+    stream.bytes[54] = 3 // wrong block alignment
+    assert(inspect(&stream).is_err())
+    stream.bytes[54] = 4
+    stream.bytes[42] = 2 // ADPCM unsupported
+    assert(inspect(&stream).err() == Some(Error.Unsupported))
+    stream.bytes[0] = 0
+    assert(inspect(&stream).err() == Some(Error.BadContainer))
+    var duplicate = memory()
+    var w = writer(&duplicate,format(48000,1,Encoding.Pcm16)).unwrap()
+    w.finish(&duplicate).unwrap()
+    for i in 0..<8 do duplicate.bytes[44 + i] = duplicate.bytes[36 + i]
+    duplicate.bytes[4] = 44
+    duplicate.length = 52
+    assert(inspect(&duplicate).err() == Some(Error.InvalidFormat))
+
+@test("WAV: transport failures poison writers, zero progress terminates, and sync failures cannot claim success")
+failures()
+    var stream = memory(1)
+    var w = writer(&stream,format(48000,2,Encoding.Pcm16)).unwrap()
+    val data: [8]u8 = [1;8]
+    assert(w.append(&stream,data[..<3]).err() == Some(Error.InvalidBuffer))
+    stream.fail_at = 46
+    assert(w.append(&stream,data[..]).err() == Some(Error.Io))
+    assert(w.finish(&stream).err() == Some(Error.State))
+    assert(w.append(&stream,data[..]).err() == Some(Error.State))
+    stream = memory()
+    w = writer(&stream,format(48000,2,Encoding.Pcm16)).unwrap()
+    stream.sync_error = true
+    assert(w.finish(&stream).err() == Some(Error.Io))
+    assert(w.finish(&stream).err() == Some(Error.State))
+    stream = memory()
+    stream.zero = true
+    assert(writer(&stream,format(48000,2,Encoding.Pcm16)).err() == Some(Error.Io))
+    stream.zero = false
+    w = writer(&stream,format(48000,2,Encoding.Pcm16)).unwrap()
+    stream.zero = true
+    assert(inspect(&stream).err() == Some(Error.Truncated))
+    stream.zero = false
+    stream.fail_at = 0
+    assert(inspect(&stream).err() == Some(Error.Io))
