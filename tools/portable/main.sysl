@@ -1,7 +1,7 @@
 @no_alloc
 import sh.sysl.wav.*
 extern "wav_probe_read" probe_read(offset: u64, out: *u8, count: usize) -> usize
-extern "wav_probe_write" probe_write(offset: u64, bytes: *const u8, count: usize) -> usize
+extern "wav_probe_write" probe_write(offset: u64, bytes: *u8, count: usize) -> usize
 struct Port
 end Port
 impl Source for Port
