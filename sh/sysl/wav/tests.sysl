@@ -1,6 +1,14 @@
 module sh.sysl.wav
 @tests
 
+import sysl.io.*
+
+private enum Fault
+    Dead
+    Full
+    Gap
+
+// A store with fault injection; the copying is `slice_at_most`'s.
 private struct Memory
     bytes: [2048]u8
     length: usize
@@ -10,32 +18,64 @@ private struct Memory
     sync_error: bool
     synced: bool
 private memory(step: usize = 2048) -> Memory = Memory([0;2048],0,step,0xffffffffffffffff,false,false,false)
-impl Source for Memory
-    size(self) -> Result[u64,Error] = Ok(u64(self.length))
-    read_at(*self, offset: u64, out: []u8) -> Result[usize,Error]
-        if offset >= self.fail_at then return Err(Error.Io)
-        if offset >= u64(self.length) || self.zero then return Ok(0)
-        val at = usize(offset)
-        var count = if out.len < self.length - at then out.len else self.length - at
-        if count > self.step then count = self.step
-        for i in 0..<count do out[i] = self.bytes[at + i]
-        Ok(count)
-impl Sink for Memory
-    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize,Error]
-        if offset >= self.fail_at then return Err(Error.Io)
-        if self.zero then return Ok(0)
-        if offset > u64(self.bytes.len) then return Err(Error.Io)
-        val at = usize(offset)
-        var count = if bytes.len < self.bytes.len - at then bytes.len else self.bytes.len - at
-        if count > self.step then count = self.step
-        if u64(at + count) > self.fail_at then count = usize(self.fail_at) - at
-        for i in 0..<count do self.bytes[at + i] = bytes[i]
-        if at + count > self.length then self.length = at + count
-        Ok(count)
-    sync(*self) -> Result[unit,Error]
-        if self.sync_error then return Err(Error.Io)
+impl Positioned for Memory
+    type Error = Fault
+    extent(*self) -> Result[u64,Fault] = Ok(u64(self.length))
+impl ReadAt for Memory
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8,Fault]
+        if offset >= self.fail_at then return Err(Fault.Dead)
+        if self.zero then return Ok(into[..<0])
+        var s = slice_at_most(self.bytes[..<self.length],self.step)
+        val got = s.read_at(offset,into) match
+            Ok(g) -> g
+            Err(_) -> return Err(Fault.Gap)
+        Ok(got)
+impl WriteAt for Memory
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize,Fault]
+        if offset >= self.fail_at then return Err(Fault.Dead)
+        if offset > u64(self.length) then return Err(Fault.Gap)
+        var n = bytes.len
+        if u64(n) > self.fail_at - offset then n = usize(self.fail_at - offset)
+        var s = slice_at_most(self.bytes[..],self.step)
+        val put = s.write_at(offset,bytes[..<n]) match
+            Ok(k) -> k
+            Err(_) -> return Err(Fault.Full)
+        if usize(offset) + put > self.length then self.length = usize(offset) + put
+        Ok(put)
+    override sync(*self) -> Result[unit,Fault]
+        if self.sync_error then return Err(Fault.Dead)
         self.synced = true
         Ok(())
+
+private info_of(b: []const u8) -> Result[Info,Error[MemoryError]]
+    var s = bytes_at(b)
+    inspect(&s)
+
+// Hand-written from the Microsoft layouts, not produced by this package.
+
+// PCM16 stereo 48 kHz, a fact chunk, an odd-length LIST chunk with its pad, then one frame of data.
+private list_file() -> [74]u8 = [82,73,70,70,66,0,0,0,87,65,86,69,
+    102,109,116,32,16,0,0,0,1,0,2,0,128,187,0,0,0,238,2,0,4,0,16,0,
+    102,97,99,116,4,0,0,0,1,0,0,0,
+    76,73,83,84,5,0,0,0,97,98,99,100,101,0,
+    100,97,116,97,4,0,0,0,9,8,7,6]
+
+// WAVE_FORMAT_EXTENSIBLE, 32-bit container holding 24 valid bits, stereo, mask 3, one frame of two.
+private ext_file() -> [76]u8 = [82,73,70,70,68,0,0,0,87,65,86,69,
+    102,109,116,32,40,0,0,0,254,255,2,0,128,187,0,0,0,220,5,0,8,0,32,0,22,0,24,0,3,0,0,0,
+    1,0,0,0,0,0,16,0,128,0,0,170,0,56,155,113,
+    100,97,116,97,8,0,0,0,1,2,3,4,5,6,7,8]
+
+// PCM8 mono; data is 3 bytes and the file ends without the pad byte (the RIFF size omits it too).
+private odd_file() -> [47]u8 = [82,73,70,70,39,0,0,0,87,65,86,69,
+    102,109,116,32,16,0,0,0,1,0,1,0,128,187,0,0,128,187,0,0,1,0,8,0,
+    100,97,116,97,3,0,0,0,10,20,30]
+
+// PCM16 stereo from a recorder that never came back to fix its sizes: RIFF and data are 0xFFFFFFFF,
+// and the last frame is cut (10 payload bytes).
+private open_file() -> [54]u8 = [82,73,70,70,255,255,255,255,87,65,86,69,
+    102,109,116,32,16,0,0,0,1,0,2,0,128,187,0,0,0,238,2,0,4,0,16,0,
+    100,97,116,97,255,255,255,255,1,2,3,4,5,6,7,8,9,10]
 
 @test("WAV: all encodings and mono/stereo/multichannel stream with partial I/O and frame seeking")
 formats()
@@ -47,41 +87,213 @@ formats()
             var data: [72]u8 = [0;72]
             val count = usize(block_align(f)) * 3
             for i in 0..<count do data[i] = u8(i * 17)
-            w.append(&stream,data[..<count]).unwrap()
+            w.append(data[..<count]).unwrap()
             assert(w.frames() == 3)
-            w.finish(&stream).unwrap()
+            w.finish().unwrap()
             assert(stream.synced)
-            w.finish(&stream).unwrap()
-            assert(w.append(&stream,[]).err() == Some(Error.State))
+            w.finish().unwrap()
+            assert(w.append([]).err() == Some(Error.State))
             val info = inspect(&stream).unwrap()
             assert(info.format == f && info.frames == 3 && info.data_bytes == u32(count))
             assert(stream.length == header_size(f) + count + (count & 1))
             var r = reader(&stream).unwrap()
             var out: [72]u8 = [0;72]
-            assert(r.read(&stream,out[..<count]).unwrap() == count)
+            assert(r.read(out[..<count]).unwrap() == count)
             for i in 0..<count do assert(out[i] == data[i])
-            assert(r.read(&stream,out[..<count]).unwrap() == 0)
+            assert(r.read(out[..<count]).unwrap() == 0)
             r.seek_frame(1).unwrap()
-            assert(r.read(&stream,out[..<count]).unwrap() == count * 2 / 3)
+            assert(r.read(out[..<count]).unwrap() == count * 2 / 3)
             assert(out[0] == data[usize(block_align(f))])
-            assert(r.seek_frame(4).err() == Some(Error.InvalidBuffer))
-            if block_align(f) > 1 then assert(r.read(&stream,out[..<1]).err() == Some(Error.InvalidBuffer))
+            assert(r.seek_frame(4).err() == Some(Error.OutOfRange))
+            if block_align(f) > 1 then assert(r.read(out[..<1]).err() == Some(Error.InvalidBuffer))
 
-@test("WAV: PCM16 header matches independent canonical RIFF bytes")
+@test("WAV: headers match hand-written canonical bytes for PCM16, 6-channel PCM24 extensible and stereo float")
 golden_header()
     var bytes: [80]u8 = [0;80]
     assert(header(format(48000,2,Encoding.Pcm16),2,bytes[..]).unwrap() == 44)
-    val expected: [44]u8 = [82,73,70,70,44,0,0,0,87,65,86,69,102,109,116,32,16,0,0,0,1,0,2,0,128,187,0,0,0,238,2,0,4,0,16,0,100,97,116,97,8,0,0,0]
-    for i in 0..<44 do assert(bytes[i] == expected[i])
+    val pcm16: [44]u8 = [82,73,70,70,44,0,0,0,87,65,86,69,102,109,116,32,16,0,0,0,1,0,2,0,128,187,0,0,0,238,2,0,4,0,16,0,100,97,116,97,8,0,0,0]
+    for i in 0..<44 do assert(bytes[i] == pcm16[i])
+
+    // WAVE_FORMAT_EXTENSIBLE: format tag 0xFFFE, cbSize 22, 24 valid bits, mask 0x3F, the PCM GUID
+    // 00000001-0000-0010-8000-00AA00389B71, two frames of 18 bytes.
+    assert(header(format(48000,6,Encoding.Pcm24,63),2,bytes[..]).unwrap() == 68)
+    val ext: [68]u8 = [82,73,70,70,96,0,0,0,87,65,86,69,
+        102,109,116,32,40,0,0,0,254,255,6,0,128,187,0,0,0,47,13,0,18,0,24,0,22,0,24,0,63,0,0,0,
+        1,0,0,0,0,0,16,0,128,0,0,170,0,56,155,113,
+        100,97,116,97,36,0,0,0]
+    for i in 0..<68 do assert(bytes[i] == ext[i])
+
+    // IEEE float: format tag 3, an 18-byte fmt with cbSize 0, a fact chunk with the frame count.
+    assert(header(format(48000,2,Encoding.Float32),2,bytes[..]).unwrap() == 58)
+    val float: [58]u8 = [82,73,70,70,66,0,0,0,87,65,86,69,
+        102,109,116,32,18,0,0,0,3,0,2,0,128,187,0,0,0,220,5,0,8,0,32,0,0,0,
+        102,97,99,116,4,0,0,0,2,0,0,0,
+        100,97,116,97,16,0,0,0]
+    for i in 0..<58 do assert(bytes[i] == float[i])
+
+@test("WAV: header refusals name their variant")
+header_errors()
+    var bytes: [80]u8 = [0;80]
     assert(header(format(0,2,Encoding.Pcm16),0,bytes[..]).err() == Some(Error.InvalidFormat))
-    assert(header(format(48000,0,Encoding.Pcm16),0,bytes[..]).is_err())
-    assert(header(format(48000,65535,Encoding.Pcm32),0,bytes[..]).is_err())
-    assert(header(format(0xffffffff,2,Encoding.Pcm16),0,bytes[..]).is_err())
-    assert(header(format(48000,2,Encoding.Pcm16,1),0,bytes[..]).is_err())
+    assert(header(format(48000,0,Encoding.Pcm16),0,bytes[..]).err() == Some(Error.InvalidFormat))
+    assert(header(format(48000,65535,Encoding.Pcm32),0,bytes[..]).err() == Some(Error.InvalidFormat))
+    assert(header(format(0xffffffff,2,Encoding.Pcm16),0,bytes[..]).err() == Some(Error.InvalidFormat))
+    assert(header(format(48000,2,Encoding.Pcm16,7),0,bytes[..]).err() == Some(Error.InvalidFormat))
+    assert(header(format(48000,2,Encoding.Pcm16,0x40000),0,bytes[..]).err() == Some(Error.InvalidFormat))
+    assert(header(format(48000,2,Encoding.Pcm16,1),0,bytes[..]).is_ok())
+    assert(header(format(48000,2,Encoding.Pcm16,0x80000000),0,bytes[..]).is_ok())
     assert(header(format(48000,2,Encoding.Pcm16),0,bytes[..<43]).err() == Some(Error.InvalidBuffer))
     assert(header(format(48000,2,Encoding.Pcm16),0xffffffffffffffff,bytes[..]).err() == Some(Error.TooLarge))
     assert(header(format(1,1,Encoding.Pcm8),4294967258,bytes[..]).is_ok())
     assert(header(format(1,1,Encoding.Pcm8),4294967259,bytes[..]).err() == Some(Error.TooLarge))
+
+private describe(e: Error[never]) -> int = e match
+    Truncated -> 1
+    BadContainer -> 2
+    InvalidFormat -> 3
+    Unsupported -> 4
+    InvalidBuffer -> 5
+    OutOfRange -> 6
+    TooLarge -> 7
+    State -> 8
+
+private checked[S: ReadAt](s: *S, f: Format) -> Result[u32,Error[S::Error]]
+    validate(f)?
+    Ok(inspect(s)?.data_bytes)
+
+private seek[S: ReadAt](r: *Reader[S], frame: u64) -> Result[unit,Error[S::Error]]
+    r.seek_frame(frame)?
+    Ok(())
+
+@test("WAV: a store-free error crosses into a store's error with ?, and matching one needs no Io arm")
+store_free_errors()
+    val bad = validate(format(0,2,Encoding.Pcm16)).err().unwrap()
+    assert(describe(bad) == 3)
+    var bytes: [80]u8 = [0;80]
+    assert(describe(header(format(48000,2,Encoding.Pcm16),0,bytes[..<4]).err().unwrap()) == 5)
+    var s = memory()
+    var w = writer(&s,format(48000,2,Encoding.Pcm16)).unwrap()
+    w.finish().unwrap()
+    assert(checked(&s,format(48000,2,Encoding.Pcm16)).unwrap() == 0)
+    assert(checked(&s,format(0,2,Encoding.Pcm16)).err() == Some(Error.InvalidFormat))
+    s.fail_at = 0
+    assert(checked(&s,format(48000,2,Encoding.Pcm16)).err() == Some(Error.Io(Fault.Dead)))
+    assert(reader(&s).err() == Some(Error.Io(Fault.Dead)))
+    s.fail_at = 0xffffffffffffffff
+    var rd = reader(&s).unwrap()
+    assert(seek(&rd,9).err() == Some(Error.OutOfRange))
+    assert(seek(&rd,0).is_ok())
+
+@test("WAV: the store's own error reaches the caller instead of a generic Io")
+store_errors()
+    var small: [10]u8 = [0;10]
+    var s = slice_at(small[..])
+    assert(writer(&s,format(48000,2,Encoding.Pcm16)).err() == Some(Error.Io(MemoryError.NoRoom)))
+    var m = memory()
+    m.fail_at = 10
+    assert(writer(&m,format(48000,2,Encoding.Pcm16)).err() == Some(Error.Io(Fault.Dead)))
+
+@test("WAV: a LIST chunk with an odd-length pad and a fact chunk before data are skipped")
+list_and_fact_chunks()
+    val b = list_file()
+    val info = info_of(b[..]).unwrap()
+    assert(info.format == format(48000,2,Encoding.Pcm16))
+    assert(info.data_offset == 70 && info.data_bytes == 4 && info.frames == 1)
+    var s = bytes_at(b[..])
+    var r = reader(&s).unwrap()
+    var out: [4]u8 = [0;4]
+    assert(r.read(out[..]).unwrap() == 4)
+    assert(out[0] == 9 && out[3] == 6)
+    // Cut inside the LIST chunk's body or pad, the chunk claims bytes the store lacks.
+    assert(info_of(b[..<60]).err() == Some(Error.Truncated))
+
+@test("WAV: extensible with valid bits below the container reads as the container")
+valid_bits_below_container()
+    val b = ext_file()
+    val info = info_of(b[..]).unwrap()
+    assert(info.format == format(48000,2,Encoding.Pcm32,3))
+    assert(info.frames == 1 && info.data_offset == 68)
+    var m = b
+    m[38] = 32
+    assert(info_of(m[..]).is_ok())
+    m[38] = 33
+    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+    m[38] = 0
+    assert(info_of(m[..]).is_ok())
+
+@test("WAV: channel masks may name fewer speakers than channels or SPEAKER_ALL, but not more")
+channel_masks()
+    var m = ext_file()
+    m[40] = 1
+    assert(info_of(m[..]).unwrap().format.channel_mask == 1)
+    m[40] = 0
+    m[43] = 128
+    assert(info_of(m[..]).unwrap().format.channel_mask == 0x80000000)
+    m[43] = 0
+    m[40] = 7
+    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+    m[40] = 3
+    m[42] = 4
+    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+
+@test("WAV: malformed extensible headers are refused with the right variant")
+extensible_errors()
+    var m = ext_file()
+    m[52] = 129
+    assert(info_of(m[..]).err() == Some(Error.Unsupported))
+    m = ext_file()
+    m[44] = 2
+    assert(info_of(m[..]).err() == Some(Error.Unsupported))
+    m = ext_file()
+    m[36] = 21
+    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+    m = ext_file()
+    m[16] = 18
+    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+
+@test("WAV: a final odd chunk without its pad byte is accepted, and a RIFF size larger than the store is clamped")
+missing_pad()
+    var b = odd_file()
+    val info = info_of(b[..]).unwrap()
+    assert(info.format == format(48000,1,Encoding.Pcm8) && info.frames == 3 && info.data_bytes == 3)
+    b[4] = 40
+    assert(info_of(b[..]).unwrap().frames == 3)
+    var s = bytes_at(b[..])
+    var r = reader(&s).unwrap()
+    var out: [3]u8 = [0;3]
+    assert(r.read(out[..]).unwrap() == 3)
+    assert(out[0] == 10 && out[2] == 30)
+
+@test("WAV: sizes left unfinalised by a recorder run to the end of the store, dropping a partial frame")
+unfinalised_sizes()
+    var b = open_file()
+    var info = info_of(b[..]).unwrap()
+    assert(info.frames == 2 && info.data_bytes == 8 && info.data_offset == 44)
+    b[4] = 0
+    b[5] = 0
+    b[6] = 0
+    b[7] = 0
+    b[40] = 0
+    b[41] = 0
+    b[42] = 0
+    b[43] = 0
+    info = info_of(b[..]).unwrap()
+    assert(info.frames == 2 && info.data_bytes == 8)
+    // A finalised file with an empty data chunk stays empty.
+    b[4] = 36
+    assert(info_of(b[..<44]).unwrap().frames == 0)
+
+@test("WAV: a chunk or data run claiming bytes the store lacks is Truncated")
+truncated_runs()
+    var b = open_file()
+    b[4] = 46
+    b[40] = 12
+    b[41] = 0
+    b[42] = 0
+    b[43] = 0
+    assert(info_of(b[..]).err() == Some(Error.Truncated))
+    assert(info_of(b[..<11]).err() == Some(Error.Truncated))
+    assert(info_of(b[..<30]).err() == Some(Error.Truncated))
 
 @test("WAV: unknown odd chunks, data before fmt, truncation, alignment, duplicate chunks and unsupported codecs")
 chunk_validation()
@@ -103,7 +315,7 @@ chunk_validation()
     assert(inspect(&stream).err() == Some(Error.InvalidFormat))
     stream.bytes[26] = 4
     stream.bytes[54] = 3 // wrong block alignment
-    assert(inspect(&stream).is_err())
+    assert(inspect(&stream).err() == Some(Error.InvalidFormat))
     stream.bytes[54] = 4
     stream.bytes[42] = 2 // ADPCM unsupported
     assert(inspect(&stream).err() == Some(Error.Unsupported))
@@ -111,34 +323,31 @@ chunk_validation()
     assert(inspect(&stream).err() == Some(Error.BadContainer))
     var duplicate = memory()
     var w = writer(&duplicate,format(48000,1,Encoding.Pcm16)).unwrap()
-    w.finish(&duplicate).unwrap()
+    w.finish().unwrap()
     for i in 0..<8 do duplicate.bytes[44 + i] = duplicate.bytes[36 + i]
     duplicate.bytes[4] = 44
     duplicate.length = 52
     assert(inspect(&duplicate).err() == Some(Error.InvalidFormat))
 
-@test("WAV: transport failures poison writers, zero progress terminates, and sync failures cannot claim success")
+@test("WAV: store failures poison writers, an empty read is the end, and sync failures cannot claim success")
 failures()
     var stream = memory(1)
     var w = writer(&stream,format(48000,2,Encoding.Pcm16)).unwrap()
     val data: [8]u8 = [1;8]
-    assert(w.append(&stream,data[..<3]).err() == Some(Error.InvalidBuffer))
+    assert(w.append(data[..<3]).err() == Some(Error.InvalidBuffer))
     stream.fail_at = 46
-    assert(w.append(&stream,data[..]).err() == Some(Error.Io))
-    assert(w.finish(&stream).err() == Some(Error.State))
-    assert(w.append(&stream,data[..]).err() == Some(Error.State))
+    assert(w.append(data[..]).err() == Some(Error.Io(Fault.Dead)))
+    assert(w.finish().err() == Some(Error.State))
+    assert(w.append(data[..]).err() == Some(Error.State))
     stream = memory()
     w = writer(&stream,format(48000,2,Encoding.Pcm16)).unwrap()
     stream.sync_error = true
-    assert(w.finish(&stream).err() == Some(Error.Io))
-    assert(w.finish(&stream).err() == Some(Error.State))
+    assert(w.finish().err() == Some(Error.Io(Fault.Dead)))
+    assert(w.finish().err() == Some(Error.State))
     stream = memory()
-    stream.zero = true
-    assert(writer(&stream,format(48000,2,Encoding.Pcm16)).err() == Some(Error.Io))
-    stream.zero = false
     w = writer(&stream,format(48000,2,Encoding.Pcm16)).unwrap()
     stream.zero = true
     assert(inspect(&stream).err() == Some(Error.Truncated))
     stream.zero = false
     stream.fail_at = 0
-    assert(inspect(&stream).err() == Some(Error.Io))
+    assert(inspect(&stream).err() == Some(Error.Io(Fault.Dead)))

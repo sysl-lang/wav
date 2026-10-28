@@ -1,22 +1,26 @@
 @no_alloc
 import sh.sysl.wav.*
+import sysl.io.*
 extern "wav_probe_read" probe_read(offset: u64, out: *u8, count: usize) -> usize
 extern "wav_probe_write" probe_write(offset: u64, bytes: *u8, count: usize) -> usize
+enum PortError
+    Dead
 struct Port
 end Port
-impl Source for Port
-    size(self) -> Result[u64,Error] = Ok(1024)
-    read_at(*self, offset: u64, out: []u8) -> Result[usize,Error] = Ok(probe_read(offset,&out[0],out.len))
-impl Sink for Port
-    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize,Error] = Ok(probe_write(offset,&bytes[0],bytes.len))
-    sync(*self) -> Result[unit,Error] = Ok(())
+impl Positioned for Port
+    type Error = PortError
+    extent(*self) -> Result[u64,PortError] = Ok(1024)
+impl ReadAt for Port
+    read_at(*self, offset: u64, out: []u8) -> Result[[]const u8,PortError] = Ok(out[..<probe_read(offset,&out[0],out.len)])
+impl WriteAt for Port
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize,PortError] = Ok(probe_write(offset,&bytes[0],bytes.len))
 @export("wav_probe")
 probe() -> int
     var p = Port()
     var w = writer(&p,format(48000,2,Encoding.Pcm16)).unwrap()
     var bytes: [16]u8 = [0;16]
-    w.append(&p,bytes[..]).unwrap()
-    w.finish(&p).unwrap()
+    w.append(bytes[..]).unwrap()
+    w.finish().unwrap()
     var r = reader(&p).unwrap()
     r.seek_frame(0).unwrap()
-    int(r.read(&p,bytes[..]).unwrap())
+    int(r.read(bytes[..]).unwrap())
