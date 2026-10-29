@@ -86,7 +86,7 @@ formats()
             var w = writer(&stream,f).unwrap()
             var data: [72]u8 = [0;72]
             val count = usize(block_align(f)) * 3
-            for i in 0..<count do data[i] = u8(i * 17)
+            for i in 0..<count do data[i] = u8.wrap(i * 17)
             w.append(data[..<count]).unwrap()
             assert(w.frames() == 3)
             w.finish().unwrap()

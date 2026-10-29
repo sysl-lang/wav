@@ -82,10 +82,10 @@ private read_all[S: ReadAt](s: *S, offset: u64, out: []u8) -> Result[unit,Error[
 private get16(b: []const u8, at: usize) -> u16 = u16(b[at]) | (u16(b[at + 1]) << 8)
 private get32(b: []const u8, at: usize) -> u32 = u32(get16(b,at)) | (u32(get16(b,at + 2)) << 16)
 private put16(b: []u8, at: usize, v: u16)
-    b[at] = u8(v)
+    b[at] = u8.wrap(v)
     b[at + 1] = u8(v >> 8)
 private put32(b: []u8, at: usize, v: u32)
-    put16(b,at,u16(v))
+    put16(b,at,u16.wrap(v))
     put16(b,at + 2,u16(v >> 16))
 private tag(b: []const u8, at: usize, s: string) -> bool
     for i in 0usize..<4 do if b[at + i] != s[i] then return false
