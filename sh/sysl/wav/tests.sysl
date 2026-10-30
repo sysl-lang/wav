@@ -17,135 +17,289 @@ private struct Memory
     zero: bool
     sync_error: bool
     synced: bool
-private memory(step: usize = 2048) -> Memory = Memory([0;2048],0,step,0xffffffffffffffff,false,false,false)
+
+private memory(step: usize = 2048) -> Memory =
+    Memory([0; 2048], 0, step, 0xffff_ffff_ffff_ffff, false, false, false)
+
 impl Positioned for Memory
     type Error = Fault
-    extent(*self) -> Result[u64,Fault] = Ok(u64(self.length))
+    extent(*self) -> Result[u64, Fault] = Ok(u64(self.length))
+
 impl ReadAt for Memory
-    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8,Fault]
+    read_at(*self, offset: u64, into: []u8) -> Result[[]const u8, Fault]
         if offset >= self.fail_at then return Err(Fault.Dead)
         if self.zero then return Ok(into[..<0])
-        var s = slice_at_most(self.bytes[..<self.length],self.step)
-        val got = s.read_at(offset,into) match
-            Ok(g) -> g
-            Err(_) -> return Err(Fault.Gap)
-        Ok(got)
+        var s = slice_at_most(self.bytes[..<self.length], self.step)
+        s.read_at(offset, into) match
+            Ok(got) -> Ok(got)
+            Err(_) -> Err(Fault.Gap)
+
 impl WriteAt for Memory
-    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize,Fault]
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, Fault]
         if offset >= self.fail_at then return Err(Fault.Dead)
         if offset > u64(self.length) then return Err(Fault.Gap)
         var n = bytes.len
         if u64(n) > self.fail_at - offset then n = usize(self.fail_at - offset)
-        var s = slice_at_most(self.bytes[..],self.step)
-        val put = s.write_at(offset,bytes[..<n]) match
+        var s = slice_at_most(self.bytes[..], self.step)
+        val put = s.write_at(offset, bytes[..<n]) match
             Ok(k) -> k
             Err(_) -> return Err(Fault.Full)
         if usize(offset) + put > self.length then self.length = usize(offset) + put
         Ok(put)
-    override sync(*self) -> Result[unit,Fault]
+
+    override sync(*self) -> Result[unit, Fault]
         if self.sync_error then return Err(Fault.Dead)
         self.synced = true
         Ok(())
 
-private info_of(b: []const u8) -> Result[Info,Error[MemoryError]]
+private info_of(b: []const u8) -> Result[Info, Error[MemoryError]]
     var s = bytes_at(b)
     inspect(&s)
 
-// Hand-written from the Microsoft layouts, not produced by this package.
+// -- Files made by other tools (scripts/fixtures.sh) ----------------------------------------------
+
+// afconvert pads the header to 4096 bytes with a FLLR chunk and writes float as a plain 16-byte `fmt `
+// with no `fact`; sox puts a `fact` after an extensible PCM `fmt `; ffmpeg writes the layout wav does.
+private val AF_PCM8 = embed("fixtures/af-pcm8-stereo.wav")
+private val AF_PCM16 = embed("fixtures/af-pcm16-stereo.wav")
+private val AF_PCM32 = embed("fixtures/af-pcm32-stereo.wav")
+private val AF_FLOAT32 = embed("fixtures/af-float32-stereo.wav")
+private val AF_PCM24_SIX = embed("fixtures/af-pcm24-six.wav")
+private val SOX_PCM16 = embed("fixtures/sox-pcm16-stereo.wav")
+private val SOX_PCM24_SIX = embed("fixtures/sox-pcm24-six.wav")
+private val FF_PCM24 = embed("fixtures/ff-pcm24-stereo.wav")
+private val FF_FLOAT32 = embed("fixtures/ff-float32-stereo.wav")
+private val FF_PCM24_SIX = embed("fixtures/ff-pcm24-six.wav")
+private val FF_FLOAT32_SIX = embed("fixtures/ff-float32-six.wav")
+
+// The 5.1 mask the tools give six channels: FL FR FC LFE BL BR.
+private const FIVE_ONE: u32 = 0x3f
+
+// The data chunk of `file`, as wav's reader hands it out, into `out`; answers its length.
+private payload(file: []const u8, out: []u8) -> usize
+    var s = bytes_at(file)
+    var r = reader(&s).unwrap()
+    val align = usize(block_align(r.info.format))
+    r.read(out[..<out.len - out.len % align]).unwrap()
+
+// `file` read by wav must say what afinfo says of it: the format, the frame count and the offset of
+// the audio data.
+private reads_as(file: []const u8, f: Format, frames: u64, offset: u64)
+    val info = info_of(file).unwrap()
+    assert_eq(info.format, f)
+    assert_eq(info.frames, frames)
+    assert_eq(info.data_offset, offset)
+    assert_eq(u64(info.data_bytes), frames * u64(block_align(f)))
+
+@test("WAV: files from afconvert, sox and ffmpeg read with the format, frames and data offset afinfo reports")
+foreign_files()
+    reads_as(AF_PCM8, format(48000, 2, Encoding.Pcm8), 4, 4096)
+    reads_as(AF_PCM16, format(48000, 2, Encoding.Pcm16), 4, 4096)
+    reads_as(AF_PCM32, format(48000, 2, Encoding.Pcm32), 4, 4096)
+    reads_as(AF_FLOAT32, format(48000, 2, Encoding.Float32), 4, 4096)
+    reads_as(AF_PCM24_SIX, format(44100, 6, Encoding.Pcm24, FIVE_ONE), 2, 4096)
+    reads_as(SOX_PCM16, format(48000, 2, Encoding.Pcm16), 4, 44)
+    reads_as(SOX_PCM24_SIX, format(44100, 6, Encoding.Pcm24, FIVE_ONE), 2, 80)
+    reads_as(FF_PCM24, format(48000, 2, Encoding.Pcm24, 3), 4, 68)
+    reads_as(FF_FLOAT32, format(48000, 2, Encoding.Float32), 4, 58)
+    reads_as(FF_PCM24_SIX, format(44100, 6, Encoding.Pcm24, FIVE_ONE), 2, 68)
+    reads_as(FF_FLOAT32_SIX, format(44100, 6, Encoding.Float32, FIVE_ONE), 2, 80)
+
+@test("WAV: one source converted by three tools reads back as the same samples")
+foreign_samples()
+    var a: [64]u8 = [0; 64]
+    var b: [64]u8 = [0; 64]
+
+    // The same 24-bit six-channel source, through all three tools.
+    val n = payload(AF_PCM24_SIX, a[..])
+    assert_eq(n, 36)
+    assert_eq(payload(SOX_PCM24_SIX, b[..]), n)
+    assert(a[..<n] == b[..<n])
+    assert_eq(payload(FF_PCM24_SIX, b[..]), n)
+    assert(a[..<n] == b[..<n])
+    // six.dat's first frame is 0.5, -0.5: 0x400000 and 0xc00000.
+    assert(a[0] == 0 && a[1] == 0 && a[2] == 0x40 && a[5] == 0xc0)
+
+    // One 16-bit source as float from two tools, and as PCM16 from two.
+    assert_eq(payload(AF_FLOAT32, a[..]), 32)
+    assert_eq(payload(FF_FLOAT32, b[..]), 32)
+    assert(a[..<32] == b[..<32])
+    var pcm16: [16]u8 = [0; 16]
+    assert_eq(payload(AF_PCM16, pcm16[..]), 16)
+    assert_eq(payload(SOX_PCM16, b[..]), 16)
+    assert(pcm16[..] == b[..<16])
+
+    // The wider PCM files carry each 16-bit sample in their top two bytes, and PCM8 its offset-binary
+    // top byte, so a reader reading from the wrong offset or with the wrong stride cannot agree.
+    assert_eq(payload(FF_PCM24, a[..]), 24)
+    assert_eq(payload(AF_PCM32, b[..]), 32)
+    var eight: [8]u8 = [0; 8]
+    assert_eq(payload(AF_PCM8, eight[..]), 8)
+    for i in 0..<8
+        assert(a[3 * i + 1] == pcm16[2 * i] && a[3 * i + 2] == pcm16[2 * i + 1])
+        assert(b[4 * i + 2] == pcm16[2 * i] && b[4 * i + 3] == pcm16[2 * i + 1])
+        assert(eight[i] == (pcm16[2 * i + 1] ^ 0x80))
+
+// Writes the samples of `file` as `f` and checks the whole store is `file`, byte for byte.
+private writes_as(file: []const u8, f: Format)
+    var samples: [64]u8 = [0; 64]
+    val n = payload(file, samples[..])
+    var store = memory()
+    var w = writer(&store, f).unwrap()
+    w.append(samples[..<n]).unwrap()
+    w.finish().unwrap()
+    assert_eq(store.length, file.len)
+    assert(store.bytes[..<store.length] == file)
+
+@test("WAV: a file wav writes is byte-identical to ffmpeg's and sox's for PCM16, PCM24 and float, stereo and 5.1")
+foreign_headers()
+    writes_as(SOX_PCM16, format(48000, 2, Encoding.Pcm16))
+    writes_as(FF_PCM24, format(48000, 2, Encoding.Pcm24, 3))
+    writes_as(FF_FLOAT32, format(48000, 2, Encoding.Float32))
+    writes_as(FF_PCM24_SIX, format(44100, 6, Encoding.Pcm24, FIVE_ONE))
+    writes_as(FF_FLOAT32_SIX, format(44100, 6, Encoding.Float32, FIVE_ONE))
+
+@test("WAV: a foreign file with one byte of its GUID, fact or format changed is refused or read differently")
+foreign_mutations()
+    var m: [128]u8 = [0; 128]
+    val n = FF_FLOAT32_SIX.len
+    for i in 0..<n do m[i] = FF_FLOAT32_SIX[i]
+    // The last byte of the KSDATAFORMAT GUID.
+    m[59] = 0x72
+    assert_eq(info_of(m[..<n]).err(), Some(Error.Unsupported))
+    m[59] = 0x71
+    // The sub-format tag: 3 (float) to 2 (ADPCM).
+    m[44] = 2
+    assert_eq(info_of(m[..<n]).err(), Some(Error.Unsupported))
+    m[44] = 3
+    // cbSize 22 to 21.
+    m[36] = 21
+    assert_eq(info_of(m[..<n]).err(), Some(Error.InvalidFormat))
+    m[36] = 22
+    assert(info_of(m[..<n]).is_ok())
+
+// -- Hand-written from the Microsoft layouts, not produced by this package ------------------------
 
 // PCM16 stereo 48 kHz, a fact chunk, an odd-length LIST chunk with its pad, then one frame of data.
-private list_file() -> [74]u8 = [82,73,70,70,66,0,0,0,87,65,86,69,
-    102,109,116,32,16,0,0,0,1,0,2,0,128,187,0,0,0,238,2,0,4,0,16,0,
-    102,97,99,116,4,0,0,0,1,0,0,0,
-    76,73,83,84,5,0,0,0,97,98,99,100,101,0,
-    100,97,116,97,4,0,0,0,9,8,7,6]
+private list_file() -> [74]u8 = [
+    82, 73, 70, 70, 66, 0, 0, 0, 87, 65, 86, 69,
+    102, 109, 116, 32, 16, 0, 0, 0, 1, 0, 2, 0, 128, 187, 0, 0, 0, 238, 2, 0, 4, 0, 16, 0,
+    102, 97, 99, 116, 4, 0, 0, 0, 1, 0, 0, 0,
+    76, 73, 83, 84, 5, 0, 0, 0, 97, 98, 99, 100, 101, 0,
+    100, 97, 116, 97, 4, 0, 0, 0, 9, 8, 7, 6]
 
 // WAVE_FORMAT_EXTENSIBLE, 32-bit container holding 24 valid bits, stereo, mask 3, one frame of two.
-private ext_file() -> [76]u8 = [82,73,70,70,68,0,0,0,87,65,86,69,
-    102,109,116,32,40,0,0,0,254,255,2,0,128,187,0,0,0,220,5,0,8,0,32,0,22,0,24,0,3,0,0,0,
-    1,0,0,0,0,0,16,0,128,0,0,170,0,56,155,113,
-    100,97,116,97,8,0,0,0,1,2,3,4,5,6,7,8]
+private ext_file() -> [76]u8 = [
+    82, 73, 70, 70, 68, 0, 0, 0, 87, 65, 86, 69,
+    102, 109, 116, 32, 40, 0, 0, 0, 254, 255, 2, 0, 128, 187, 0, 0, 0, 220, 5, 0, 8, 0, 32, 0,
+    22, 0, 24, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113,
+    100, 97, 116, 97, 8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]
 
 // PCM8 mono; data is 3 bytes and the file ends without the pad byte (the RIFF size omits it too).
-private odd_file() -> [47]u8 = [82,73,70,70,39,0,0,0,87,65,86,69,
-    102,109,116,32,16,0,0,0,1,0,1,0,128,187,0,0,128,187,0,0,1,0,8,0,
-    100,97,116,97,3,0,0,0,10,20,30]
+private odd_file() -> [47]u8 = [
+    82, 73, 70, 70, 39, 0, 0, 0, 87, 65, 86, 69,
+    102, 109, 116, 32, 16, 0, 0, 0, 1, 0, 1, 0, 128, 187, 0, 0, 128, 187, 0, 0, 1, 0, 8, 0,
+    100, 97, 116, 97, 3, 0, 0, 0, 10, 20, 30]
 
 // PCM16 stereo from a recorder that never came back to fix its sizes: RIFF and data are 0xFFFFFFFF,
 // and the last frame is cut (10 payload bytes).
-private open_file() -> [54]u8 = [82,73,70,70,255,255,255,255,87,65,86,69,
-    102,109,116,32,16,0,0,0,1,0,2,0,128,187,0,0,0,238,2,0,4,0,16,0,
-    100,97,116,97,255,255,255,255,1,2,3,4,5,6,7,8,9,10]
+private open_file() -> [54]u8 = [
+    82, 73, 70, 70, 255, 255, 255, 255, 87, 65, 86, 69,
+    102, 109, 116, 32, 16, 0, 0, 0, 1, 0, 2, 0, 128, 187, 0, 0, 0, 238, 2, 0, 4, 0, 16, 0,
+    100, 97, 116, 97, 255, 255, 255, 255, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 @test("WAV: all encodings and mono/stereo/multichannel stream with partial I/O and frame seeking")
 formats()
-    for encoding in [Encoding.Pcm8,Encoding.Pcm16,Encoding.Pcm24,Encoding.Pcm32,Encoding.Float32]
-        for channels in [1u16,2u16,6u16]
+    val channel_counts: [3]u16 = [1, 2, 6]
+    for encoding in [Encoding.Pcm8, Encoding.Pcm16, Encoding.Pcm24, Encoding.Pcm32, Encoding.Float32]
+        for channels in channel_counts
             var stream = memory(3)
-            val f = format(48000,channels,encoding,if channels == 6 then 63 else 0)
-            var w = writer(&stream,f).unwrap()
-            var data: [72]u8 = [0;72]
+            val f = format(48000, channels, encoding, if channels == 6 then FIVE_ONE else 0)
+            var w = writer(&stream, f).unwrap()
+            var data: [72]u8 = [0; 72]
             val count = usize(block_align(f)) * 3
             for i in 0..<count do data[i] = u8.wrap(i * 17)
             w.append(data[..<count]).unwrap()
-            assert(w.frames() == 3)
+            assert_eq(w.frames(), 3)
             w.finish().unwrap()
             assert(stream.synced)
             w.finish().unwrap()
-            assert(w.append([]).err() == Some(Error.State))
+            assert_eq(w.append([]).err(), Some(Error.State))
             val info = inspect(&stream).unwrap()
             assert(info.format == f && info.frames == 3 && info.data_bytes == u32(count))
-            assert(stream.length == header_size(f) + count + (count & 1))
+            assert_eq(stream.length, header_size(f) + count + (count & 1))
             var r = reader(&stream).unwrap()
-            var out: [72]u8 = [0;72]
-            assert(r.read(out[..<count]).unwrap() == count)
-            for i in 0..<count do assert(out[i] == data[i])
-            assert(r.read(out[..<count]).unwrap() == 0)
+            var out: [72]u8 = [0; 72]
+            assert_eq(r.read(out[..<count]).unwrap(), count)
+            assert(out[..<count] == data[..<count])
+            assert_eq(r.read(out[..<count]).unwrap(), 0)
             r.seek_frame(1).unwrap()
-            assert(r.read(out[..<count]).unwrap() == count * 2 / 3)
+            assert_eq(r.read(out[..<count]).unwrap(), count * 2 / 3)
             assert(out[0] == data[usize(block_align(f))])
-            assert(r.seek_frame(4).err() == Some(Error.OutOfRange))
-            if block_align(f) > 1 then assert(r.read(out[..<1]).err() == Some(Error.InvalidBuffer))
+            assert_eq(r.seek_frame(4).err(), Some(Error.OutOfRange))
+            if block_align(f) > 1 then assert_eq(r.read(out[..<1]).err(), Some(Error.InvalidBuffer))
 
 @test("WAV: headers match hand-written canonical bytes for PCM16, 6-channel PCM24 extensible and stereo float")
 golden_header()
-    var bytes: [80]u8 = [0;80]
-    assert(header(format(48000,2,Encoding.Pcm16),2,bytes[..]).unwrap() == 44)
-    val pcm16: [44]u8 = [82,73,70,70,44,0,0,0,87,65,86,69,102,109,116,32,16,0,0,0,1,0,2,0,128,187,0,0,0,238,2,0,4,0,16,0,100,97,116,97,8,0,0,0]
-    for i in 0..<44 do assert(bytes[i] == pcm16[i])
+    var bytes: [80]u8 = [0; 80]
+    assert_eq(header(format(48000, 2, Encoding.Pcm16), 2, bytes[..]).unwrap(), 44)
+    val pcm16: [44]u8 = [
+        82, 73, 70, 70, 44, 0, 0, 0, 87, 65, 86, 69,
+        102, 109, 116, 32, 16, 0, 0, 0, 1, 0, 2, 0, 128, 187, 0, 0, 0, 238, 2, 0, 4, 0, 16, 0,
+        100, 97, 116, 97, 8, 0, 0, 0]
+    assert(bytes[..<44] == pcm16[..])
 
     // WAVE_FORMAT_EXTENSIBLE: format tag 0xFFFE, cbSize 22, 24 valid bits, mask 0x3F, the PCM GUID
     // 00000001-0000-0010-8000-00AA00389B71, two frames of 18 bytes.
-    assert(header(format(48000,6,Encoding.Pcm24,63),2,bytes[..]).unwrap() == 68)
-    val ext: [68]u8 = [82,73,70,70,96,0,0,0,87,65,86,69,
-        102,109,116,32,40,0,0,0,254,255,6,0,128,187,0,0,0,47,13,0,18,0,24,0,22,0,24,0,63,0,0,0,
-        1,0,0,0,0,0,16,0,128,0,0,170,0,56,155,113,
-        100,97,116,97,36,0,0,0]
-    for i in 0..<68 do assert(bytes[i] == ext[i])
+    assert_eq(header(format(48000, 6, Encoding.Pcm24, FIVE_ONE), 2, bytes[..]).unwrap(), 68)
+    val ext: [68]u8 = [
+        82, 73, 70, 70, 96, 0, 0, 0, 87, 65, 86, 69,
+        102, 109, 116, 32, 40, 0, 0, 0, 254, 255, 6, 0, 128, 187, 0, 0, 0, 47, 13, 0, 18, 0, 24, 0,
+        22, 0, 24, 0, 63, 0, 0, 0, 1, 0, 0, 0, 0, 0, 16, 0, 128, 0, 0, 170, 0, 56, 155, 113,
+        100, 97, 116, 97, 36, 0, 0, 0]
+    assert(bytes[..<68] == ext[..])
 
     // IEEE float: format tag 3, an 18-byte fmt with cbSize 0, a fact chunk with the frame count.
-    assert(header(format(48000,2,Encoding.Float32),2,bytes[..]).unwrap() == 58)
-    val float: [58]u8 = [82,73,70,70,66,0,0,0,87,65,86,69,
-        102,109,116,32,18,0,0,0,3,0,2,0,128,187,0,0,0,220,5,0,8,0,32,0,0,0,
-        102,97,99,116,4,0,0,0,2,0,0,0,
-        100,97,116,97,16,0,0,0]
-    for i in 0..<58 do assert(bytes[i] == float[i])
+    assert_eq(header(format(48000, 2, Encoding.Float32), 2, bytes[..]).unwrap(), 58)
+    val float: [58]u8 = [
+        82, 73, 70, 70, 66, 0, 0, 0, 87, 65, 86, 69,
+        102, 109, 116, 32, 18, 0, 0, 0, 3, 0, 2, 0, 128, 187, 0, 0, 0, 220, 5, 0, 8, 0, 32, 0, 0, 0,
+        102, 97, 99, 116, 4, 0, 0, 0, 2, 0, 0, 0,
+        100, 97, 116, 97, 16, 0, 0, 0]
+    assert(bytes[..<58] == float[..])
 
 @test("WAV: header refusals name their variant")
 header_errors()
-    var bytes: [80]u8 = [0;80]
-    assert(header(format(0,2,Encoding.Pcm16),0,bytes[..]).err() == Some(Error.InvalidFormat))
-    assert(header(format(48000,0,Encoding.Pcm16),0,bytes[..]).err() == Some(Error.InvalidFormat))
-    assert(header(format(48000,65535,Encoding.Pcm32),0,bytes[..]).err() == Some(Error.InvalidFormat))
-    assert(header(format(0xffffffff,2,Encoding.Pcm16),0,bytes[..]).err() == Some(Error.InvalidFormat))
-    assert(header(format(48000,2,Encoding.Pcm16,7),0,bytes[..]).err() == Some(Error.InvalidFormat))
-    assert(header(format(48000,2,Encoding.Pcm16,0x40000),0,bytes[..]).err() == Some(Error.InvalidFormat))
-    assert(header(format(48000,2,Encoding.Pcm16,1),0,bytes[..]).is_ok())
-    assert(header(format(48000,2,Encoding.Pcm16,0x80000000),0,bytes[..]).is_ok())
-    assert(header(format(48000,2,Encoding.Pcm16),0,bytes[..<43]).err() == Some(Error.InvalidBuffer))
-    assert(header(format(48000,2,Encoding.Pcm16),0xffffffffffffffff,bytes[..]).err() == Some(Error.TooLarge))
-    assert(header(format(1,1,Encoding.Pcm8),4294967258,bytes[..]).is_ok())
-    assert(header(format(1,1,Encoding.Pcm8),4294967259,bytes[..]).err() == Some(Error.TooLarge))
+    var bytes: [80]u8 = [0; 80]
+    val pcm16 = format(48000, 2, Encoding.Pcm16)
+    assert_eq(header(format(0, 2, Encoding.Pcm16), 0, bytes[..]).err(), Some(Error.InvalidFormat))
+    assert_eq(header(format(48000, 0, Encoding.Pcm16), 0, bytes[..]).err(), Some(Error.InvalidFormat))
+    assert_eq(header(format(48000, 65535, Encoding.Pcm32), 0, bytes[..]).err(), Some(Error.InvalidFormat))
+    assert_eq(header(format(0xffff_ffff, 2, Encoding.Pcm16), 0, bytes[..]).err(), Some(Error.InvalidFormat))
+    assert_eq(header(format(48000, 2, Encoding.Pcm16, 7), 0, bytes[..]).err(), Some(Error.InvalidFormat))
+    assert_eq(header(format(48000, 2, Encoding.Pcm16, 0x4_0000), 0, bytes[..]).err(), Some(Error.InvalidFormat))
+    assert_eq(header(format(48000, 2, Encoding.Pcm16, 1), 0, bytes[..]).unwrap(), 68)
+    assert_eq(header(format(48000, 2, Encoding.Pcm16, 0x8000_0000), 0, bytes[..]).unwrap(), 68)
+    assert_eq(header(format(48000, 2, Encoding.Pcm16, 0x2_0000), 0, bytes[..]).unwrap(), 68)
+    assert_eq(header(pcm16, 0, bytes[..<43]).err(), Some(Error.InvalidBuffer))
+    assert_eq(header(pcm16, 0xffff_ffff_ffff_ffff, bytes[..]).err(), Some(Error.TooLarge))
+    assert_eq(header(format(1, 1, Encoding.Pcm8), 4294967258, bytes[..]).unwrap(), 44)
+    assert_eq(header(format(1, 1, Encoding.Pcm8), 4294967259, bytes[..]).err(), Some(Error.TooLarge))
+
+@test("WAV: append refuses data that would overflow the 32-bit sizes, before writing, and stays usable")
+append_too_large()
+    var store = memory()
+    var w = writer(&store, format(1, 1, Encoding.Pcm8)).unwrap()
+    // One frame short of the largest PCM8 payload the 32-bit RIFF size can describe (2^32 - 38).
+    w.bytes = 4294967257
+    val two: [2]u8 = [7, 9]
+    assert_eq(w.append(two[..]).err(), Some(Error.TooLarge))
+    assert_eq(store.length, 44)
+    assert_eq(w.frames(), 4294967257)
+    // The last frame that fits is let through to the store, which has nothing at that offset: the
+    // refusal above left the writer unpoisoned, and `fits` is not off by one.
+    assert_eq(w.append(two[..<1]).err(), Some(Error.Io(Fault.Gap)))
+    assert_eq(w.append(two[..<1]).err(), Some(Error.State))
 
 private describe(e: Error[never]) -> int = e match
     Truncated -> 1
@@ -157,67 +311,67 @@ private describe(e: Error[never]) -> int = e match
     TooLarge -> 7
     State -> 8
 
-private checked[S: ReadAt](s: *S, f: Format) -> Result[u32,Error[S::Error]]
+private checked[S: ReadAt](s: *S, f: Format) -> Result[u32, Error[S::Error]]
     validate(f)?
     Ok(inspect(s)?.data_bytes)
 
-private seek[S: ReadAt](r: *Reader[S], frame: u64) -> Result[unit,Error[S::Error]]
+private seek[S: ReadAt](r: *Reader[S], frame: u64) -> Result[unit, Error[S::Error]]
     r.seek_frame(frame)?
     Ok(())
 
 @test("WAV: a store-free error crosses into a store's error with ?, and matching one needs no Io arm")
 store_free_errors()
-    val bad = validate(format(0,2,Encoding.Pcm16)).err().unwrap()
-    assert(describe(bad) == 3)
-    var bytes: [80]u8 = [0;80]
-    assert(describe(header(format(48000,2,Encoding.Pcm16),0,bytes[..<4]).err().unwrap()) == 5)
+    val bad = validate(format(0, 2, Encoding.Pcm16)).err().unwrap()
+    assert_eq(describe(bad), 3)
+    var bytes: [80]u8 = [0; 80]
+    assert_eq(describe(header(format(48000, 2, Encoding.Pcm16), 0, bytes[..<4]).err().unwrap()), 5)
     var s = memory()
-    var w = writer(&s,format(48000,2,Encoding.Pcm16)).unwrap()
+    var w = writer(&s, format(48000, 2, Encoding.Pcm16)).unwrap()
     w.finish().unwrap()
-    assert(checked(&s,format(48000,2,Encoding.Pcm16)).unwrap() == 0)
-    assert(checked(&s,format(0,2,Encoding.Pcm16)).err() == Some(Error.InvalidFormat))
+    assert_eq(checked(&s, format(48000, 2, Encoding.Pcm16)).unwrap(), 0)
+    assert_eq(checked(&s, format(0, 2, Encoding.Pcm16)).err(), Some(Error.InvalidFormat))
     s.fail_at = 0
-    assert(checked(&s,format(48000,2,Encoding.Pcm16)).err() == Some(Error.Io(Fault.Dead)))
-    assert(reader(&s).err() == Some(Error.Io(Fault.Dead)))
-    s.fail_at = 0xffffffffffffffff
+    assert_eq(checked(&s, format(48000, 2, Encoding.Pcm16)).err(), Some(Error.Io(Fault.Dead)))
+    assert_eq(reader(&s).err(), Some(Error.Io(Fault.Dead)))
+    s.fail_at = 0xffff_ffff_ffff_ffff
     var rd = reader(&s).unwrap()
-    assert(seek(&rd,9).err() == Some(Error.OutOfRange))
-    assert(seek(&rd,0).is_ok())
+    assert_eq(seek(&rd, 9).err(), Some(Error.OutOfRange))
+    assert(seek(&rd, 0).is_ok())
 
 @test("WAV: the store's own error reaches the caller instead of a generic Io")
 store_errors()
-    var small: [10]u8 = [0;10]
+    var small: [10]u8 = [0; 10]
     var s = slice_at(small[..])
-    assert(writer(&s,format(48000,2,Encoding.Pcm16)).err() == Some(Error.Io(MemoryError.NoRoom)))
+    assert_eq(writer(&s, format(48000, 2, Encoding.Pcm16)).err(), Some(Error.Io(MemoryError.NoRoom)))
     var m = memory()
     m.fail_at = 10
-    assert(writer(&m,format(48000,2,Encoding.Pcm16)).err() == Some(Error.Io(Fault.Dead)))
+    assert_eq(writer(&m, format(48000, 2, Encoding.Pcm16)).err(), Some(Error.Io(Fault.Dead)))
 
 @test("WAV: a LIST chunk with an odd-length pad and a fact chunk before data are skipped")
 list_and_fact_chunks()
     val b = list_file()
     val info = info_of(b[..]).unwrap()
-    assert(info.format == format(48000,2,Encoding.Pcm16))
+    assert_eq(info.format, format(48000, 2, Encoding.Pcm16))
     assert(info.data_offset == 70 && info.data_bytes == 4 && info.frames == 1)
     var s = bytes_at(b[..])
     var r = reader(&s).unwrap()
-    var out: [4]u8 = [0;4]
-    assert(r.read(out[..]).unwrap() == 4)
+    var out: [4]u8 = [0; 4]
+    assert_eq(r.read(out[..]).unwrap(), 4)
     assert(out[0] == 9 && out[3] == 6)
     // Cut inside the LIST chunk's body or pad, the chunk claims bytes the store lacks.
-    assert(info_of(b[..<60]).err() == Some(Error.Truncated))
+    assert_eq(info_of(b[..<60]).err(), Some(Error.Truncated))
 
 @test("WAV: extensible with valid bits below the container reads as the container")
 valid_bits_below_container()
     val b = ext_file()
     val info = info_of(b[..]).unwrap()
-    assert(info.format == format(48000,2,Encoding.Pcm32,3))
+    assert_eq(info.format, format(48000, 2, Encoding.Pcm32, 3))
     assert(info.frames == 1 && info.data_offset == 68)
     var m = b
     m[38] = 32
     assert(info_of(m[..]).is_ok())
     m[38] = 33
-    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+    assert_eq(info_of(m[..]).err(), Some(Error.InvalidFormat))
     m[38] = 0
     assert(info_of(m[..]).is_ok())
 
@@ -225,43 +379,43 @@ valid_bits_below_container()
 channel_masks()
     var m = ext_file()
     m[40] = 1
-    assert(info_of(m[..]).unwrap().format.channel_mask == 1)
+    assert_eq(info_of(m[..]).unwrap().format.channel_mask, 1)
     m[40] = 0
     m[43] = 128
-    assert(info_of(m[..]).unwrap().format.channel_mask == 0x80000000)
+    assert_eq(info_of(m[..]).unwrap().format.channel_mask, 0x8000_0000)
     m[43] = 0
     m[40] = 7
-    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+    assert_eq(info_of(m[..]).err(), Some(Error.InvalidFormat))
     m[40] = 3
     m[42] = 4
-    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+    assert_eq(info_of(m[..]).err(), Some(Error.InvalidFormat))
 
 @test("WAV: malformed extensible headers are refused with the right variant")
 extensible_errors()
     var m = ext_file()
     m[52] = 129
-    assert(info_of(m[..]).err() == Some(Error.Unsupported))
+    assert_eq(info_of(m[..]).err(), Some(Error.Unsupported))
     m = ext_file()
     m[44] = 2
-    assert(info_of(m[..]).err() == Some(Error.Unsupported))
+    assert_eq(info_of(m[..]).err(), Some(Error.Unsupported))
     m = ext_file()
     m[36] = 21
-    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+    assert_eq(info_of(m[..]).err(), Some(Error.InvalidFormat))
     m = ext_file()
     m[16] = 18
-    assert(info_of(m[..]).err() == Some(Error.InvalidFormat))
+    assert_eq(info_of(m[..]).err(), Some(Error.InvalidFormat))
 
 @test("WAV: a final odd chunk without its pad byte is accepted, and a RIFF size larger than the store is clamped")
 missing_pad()
     var b = odd_file()
     val info = info_of(b[..]).unwrap()
-    assert(info.format == format(48000,1,Encoding.Pcm8) && info.frames == 3 && info.data_bytes == 3)
+    assert(info.format == format(48000, 1, Encoding.Pcm8) && info.frames == 3 && info.data_bytes == 3)
     b[4] = 40
-    assert(info_of(b[..]).unwrap().frames == 3)
+    assert_eq(info_of(b[..]).unwrap().frames, 3)
     var s = bytes_at(b[..])
     var r = reader(&s).unwrap()
-    var out: [3]u8 = [0;3]
-    assert(r.read(out[..]).unwrap() == 3)
+    var out: [3]u8 = [0; 3]
+    assert_eq(r.read(out[..]).unwrap(), 3)
     assert(out[0] == 10 && out[2] == 30)
 
 @test("WAV: sizes left unfinalised by a recorder run to the end of the store, dropping a partial frame")
@@ -269,39 +423,31 @@ unfinalised_sizes()
     var b = open_file()
     var info = info_of(b[..]).unwrap()
     assert(info.frames == 2 && info.data_bytes == 8 && info.data_offset == 44)
-    b[4] = 0
-    b[5] = 0
-    b[6] = 0
-    b[7] = 0
-    b[40] = 0
-    b[41] = 0
-    b[42] = 0
-    b[43] = 0
+    for i in 4..<8 do b[i] = 0
+    for i in 40..<44 do b[i] = 0
     info = info_of(b[..]).unwrap()
     assert(info.frames == 2 && info.data_bytes == 8)
     // A finalised file with an empty data chunk stays empty.
     b[4] = 36
-    assert(info_of(b[..<44]).unwrap().frames == 0)
+    assert_eq(info_of(b[..<44]).unwrap().frames, 0)
 
 @test("WAV: a chunk or data run claiming bytes the store lacks is Truncated")
 truncated_runs()
     var b = open_file()
     b[4] = 46
     b[40] = 12
-    b[41] = 0
-    b[42] = 0
-    b[43] = 0
-    assert(info_of(b[..]).err() == Some(Error.Truncated))
-    assert(info_of(b[..<11]).err() == Some(Error.Truncated))
-    assert(info_of(b[..<30]).err() == Some(Error.Truncated))
+    for i in 41..<44 do b[i] = 0
+    assert_eq(info_of(b[..]).err(), Some(Error.Truncated))
+    assert_eq(info_of(b[..<11]).err(), Some(Error.Truncated))
+    assert_eq(info_of(b[..<30]).err(), Some(Error.Truncated))
 
 @test("WAV: unknown odd chunks, data before fmt, truncation, alignment, duplicate chunks and unsupported codecs")
 chunk_validation()
     var stream = memory()
     var header_bytes: [80]u8
-    header(format(48000,2,Encoding.Pcm16),1,header_bytes[..]).unwrap()
+    header(format(48000, 2, Encoding.Pcm16), 1, header_bytes[..]).unwrap()
     // Independent layout: RIFF/WAVE + JUNK(1)+pad + data(4) + fmt(16).
-    val prefix: [22]u8 = [82,73,70,70,50,0,0,0,87,65,86,69,74,85,78,75,1,0,0,0,7,0]
+    val prefix: [22]u8 = [82, 73, 70, 70, 50, 0, 0, 0, 87, 65, 86, 69, 74, 85, 78, 75, 1, 0, 0, 0, 7, 0]
     for i in 0..<22 do stream.bytes[i] = prefix[i]
     for i in 0..<8 do stream.bytes[22 + i] = header_bytes[36 + i]
     for i in 0..<24 do stream.bytes[34 + i] = header_bytes[12 + i]
@@ -309,45 +455,47 @@ chunk_validation()
     val info = inspect(&stream).unwrap()
     assert(info.data_offset == 30 && info.frames == 1)
     stream.length = 57
-    assert(inspect(&stream).err() == Some(Error.Truncated))
+    assert_eq(inspect(&stream).err(), Some(Error.Truncated))
     stream.length = 58
     stream.bytes[26] = 3
-    assert(inspect(&stream).err() == Some(Error.InvalidFormat))
+    assert_eq(inspect(&stream).err(), Some(Error.InvalidFormat))
     stream.bytes[26] = 4
-    stream.bytes[54] = 3 // wrong block alignment
-    assert(inspect(&stream).err() == Some(Error.InvalidFormat))
+    // Wrong block alignment.
+    stream.bytes[54] = 3
+    assert_eq(inspect(&stream).err(), Some(Error.InvalidFormat))
     stream.bytes[54] = 4
-    stream.bytes[42] = 2 // ADPCM unsupported
-    assert(inspect(&stream).err() == Some(Error.Unsupported))
+    // ADPCM.
+    stream.bytes[42] = 2
+    assert_eq(inspect(&stream).err(), Some(Error.Unsupported))
     stream.bytes[0] = 0
-    assert(inspect(&stream).err() == Some(Error.BadContainer))
+    assert_eq(inspect(&stream).err(), Some(Error.BadContainer))
     var duplicate = memory()
-    var w = writer(&duplicate,format(48000,1,Encoding.Pcm16)).unwrap()
+    var w = writer(&duplicate, format(48000, 1, Encoding.Pcm16)).unwrap()
     w.finish().unwrap()
     for i in 0..<8 do duplicate.bytes[44 + i] = duplicate.bytes[36 + i]
     duplicate.bytes[4] = 44
     duplicate.length = 52
-    assert(inspect(&duplicate).err() == Some(Error.InvalidFormat))
+    assert_eq(inspect(&duplicate).err(), Some(Error.InvalidFormat))
 
 @test("WAV: store failures poison writers, an empty read is the end, and sync failures cannot claim success")
 failures()
     var stream = memory(1)
-    var w = writer(&stream,format(48000,2,Encoding.Pcm16)).unwrap()
-    val data: [8]u8 = [1;8]
-    assert(w.append(data[..<3]).err() == Some(Error.InvalidBuffer))
+    var w = writer(&stream, format(48000, 2, Encoding.Pcm16)).unwrap()
+    val data: [8]u8 = [1; 8]
+    assert_eq(w.append(data[..<3]).err(), Some(Error.InvalidBuffer))
     stream.fail_at = 46
-    assert(w.append(data[..]).err() == Some(Error.Io(Fault.Dead)))
-    assert(w.finish().err() == Some(Error.State))
-    assert(w.append(data[..]).err() == Some(Error.State))
+    assert_eq(w.append(data[..]).err(), Some(Error.Io(Fault.Dead)))
+    assert_eq(w.finish().err(), Some(Error.State))
+    assert_eq(w.append(data[..]).err(), Some(Error.State))
     stream = memory()
-    w = writer(&stream,format(48000,2,Encoding.Pcm16)).unwrap()
+    w = writer(&stream, format(48000, 2, Encoding.Pcm16)).unwrap()
     stream.sync_error = true
-    assert(w.finish().err() == Some(Error.Io(Fault.Dead)))
-    assert(w.finish().err() == Some(Error.State))
+    assert_eq(w.finish().err(), Some(Error.Io(Fault.Dead)))
+    assert_eq(w.finish().err(), Some(Error.State))
     stream = memory()
-    w = writer(&stream,format(48000,2,Encoding.Pcm16)).unwrap()
+    w = writer(&stream, format(48000, 2, Encoding.Pcm16)).unwrap()
     stream.zero = true
-    assert(inspect(&stream).err() == Some(Error.Truncated))
+    assert_eq(inspect(&stream).err(), Some(Error.Truncated))
     stream.zero = false
     stream.fail_at = 0
-    assert(inspect(&stream).err() == Some(Error.Io(Fault.Dead)))
+    assert_eq(inspect(&stream).err(), Some(Error.Io(Fault.Dead)))

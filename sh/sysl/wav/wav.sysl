@@ -2,6 +2,9 @@ module sh.sysl.wav
 @no_alloc
 
 import sysl.io.*
+import sysl.math.min
+import sysl.raw.ptr_cast
+import sysl.slices.{as_mut_ptr, fill}
 
 /** Why a WAV could not be read or written.
  *
@@ -53,7 +56,8 @@ struct Format derives Eq
     encoding: Encoding
     channel_mask: u32
 
-format(rate: u32, channels: u16, encoding: Encoding, channel_mask: u32 = 0) -> Format = Format(rate,channels,encoding,channel_mask)
+format(rate: u32, channels: u16, encoding: Encoding, channel_mask: u32 = 0) -> Format =
+    Format(rate, channels, encoding, channel_mask)
 
 sample_bytes(encoding: Encoding) -> u32 = encoding match
     Encoding.Pcm8 -> 1
@@ -62,87 +66,183 @@ sample_bytes(encoding: Encoding) -> u32 = encoding match
     Encoding.Pcm32 | Encoding.Float32 -> 4
 
 block_align(f: Format) -> u32 = u32(f.channels) * sample_bytes(f.encoding)
+
+// -- The bytes of the format (mmreg.h, ksmedia.h) -------------------------------------------------
+
+// `wFormatTag`: plain integer PCM, IEEE float, and the extensible form whose real tag is the first
+// two bytes of its sub-format GUID.
+private const TAG_PCM: u16 = 1
+private const TAG_FLOAT: u16 = 3
+private const TAG_EXTENSIBLE: u16 = 0xfffe
+
+// Every KSDATAFORMAT_SUBTYPE_* GUID is {0000tttt-0000-0010-8000-00aa00389b71}: the tag, then these
+// fourteen bytes as they lie in the file.
+private val GUID_TAIL: [14]u8 = [0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xaa, 0, 0x38, 0x9b, 0x71]
+
+// `cbSize` of WAVEFORMATEXTENSIBLE: the 22 bytes from `wValidBitsPerSample` to the end of the GUID.
+private const EXTENSION_BYTES: u16 = 22
+
+// SPEAKER_FRONT_LEFT up to SPEAKER_TOP_BACK_RIGHT, and SPEAKER_ALL in the top bit.
+private const SPEAKERS: u32 = 0x3_ffff
+private const SPEAKER_ALL: u32 = 0x8000_0000
+
+// The RIFF and data sizes are 32 bits, and a recorder that never finalised leaves the largest.
+private const UNSIZED: u32 = 0xffff_ffff
+private const SIZE_LIMIT: u64 = 0xffff_ffff
+
+private val RIFF: [4]u8 = "RIFF"
+private val WAVE: [4]u8 = "WAVE"
+private val FMT: [4]u8 = "fmt "
+private val FACT: [4]u8 = "fact"
+private val DATA: [4]u8 = "data"
+
+// The file's first twelve bytes.
+@packed
+@byte_order(little)
+private struct Riff
+    id: [4]u8
+    size: u32
+    form: [4]u8
+
+@assert(sizeof(Riff) == 12, "a RIFF header is 12 bytes")
+
+// The eight bytes in front of every chunk's body.
+@packed
+@byte_order(little)
+private struct Chunk
+    id: [4]u8
+    size: u32
+
+@assert(sizeof(Chunk) == 8, "a chunk header is 8 bytes")
+
+// WAVEFORMAT plus `wBitsPerSample`: the 16 bytes every `fmt ` chunk opens with.
+@packed
+@byte_order(little)
+private struct WaveFormat
+    tag: u16
+    channels: u16
+    rate: u32
+    byte_rate: u32
+    block_align: u16
+    bits: u16
+
+@assert(sizeof(WaveFormat) == 16, "PCMWAVEFORMAT is 16 bytes")
+
+// What follows `WaveFormat` in WAVEFORMATEXTENSIBLE; WAVEFORMATEX stops after `size`.
+@packed
+@byte_order(little)
+private struct Extension
+    size: u16
+    valid_bits: u16
+    channel_mask: u32
+    sub_tag: u16
+    guid_tail: [14]u8
+
+@assert(sizeof(Extension) == 24, "the extensible tail is 24 bytes")
+
+// The `fact` chunk a float file carries: its frame count.
+@packed
+@byte_order(little)
+private struct Fact
+    chunk: Chunk
+    frames: u32
+
+private const FMT_AT: usize = 12
+private const FORMAT_AT: usize = 20
+private const EXTENSION_AT: usize = 36
+
+// `T` laid over `bytes` at `offset`, bounds checked; a packed struct has no alignment to keep.
+private at[T](bytes: []u8, offset: usize) -> *T
+    if offset + sizeof(T) > bytes.len then panic("sh.sysl.wav: a structure past the end of its buffer")
+    ptr_cast(usize(as_mut_ptr(bytes)) + offset)
+
 /** A channel mask names at most as many speakers as there are channels (the spec lets it name fewer),
  * and may carry `SPEAKER_ALL` in the top bit.
  */
-validate(f: Format) -> Result[unit,Error[never]]
+validate(f: Format) -> Result[unit, Error[never]]
     val align = block_align(f)
-    if f.rate == 0 || f.channels == 0 || align > 65535 || u64(f.rate) * u64(align) > 0xffffffff then return Err(Error.InvalidFormat)
-    if f.channel_mask != 0
-        var count: u32 = 0
-        for i in 0u32..<32 do if f.channel_mask & (1u32 << i) != 0 then count += 1
-        if count > u32(f.channels) || f.channel_mask & ~0x8003ffffu32 != 0 then return Err(Error.InvalidFormat)
+    if f.rate == 0 || f.channels == 0 || align > 0xffff || u64(f.rate) * u64(align) > SIZE_LIMIT
+        return Err(Error.InvalidFormat)
+    if f.channel_mask.count_ones() > u32(f.channels) || f.channel_mask & ~(SPEAKERS | SPEAKER_ALL) != 0
+        return Err(Error.InvalidFormat)
     Ok(())
 
 // `read_exact_at` hands back a prefix of `out`; a short one means the store ended.
-private read_all[S: ReadAt](s: *S, offset: u64, out: []u8) -> Result[unit,Error[S::Error]]
-    val got = read_exact_at(s,offset,out)?
-    if got.len < out.len then return Err(Error.Truncated)
+private read_all[S: ReadAt](s: *S, offset: u64, out: []u8) -> Result[unit, Error[S::Error]]
+    if read_exact_at(s, offset, out)?.len < out.len then return Err(Error.Truncated)
     Ok(())
-private get16(b: []const u8, at: usize) -> u16 = u16(b[at]) | (u16(b[at + 1]) << 8)
-private get32(b: []const u8, at: usize) -> u32 = u32(get16(b,at)) | (u32(get16(b,at + 2)) << 16)
-private put16(b: []u8, at: usize, v: u16)
-    b[at] = u8.wrap(v)
-    b[at + 1] = u8(v >> 8)
-private put32(b: []u8, at: usize, v: u32)
-    put16(b,at,u16.wrap(v))
-    put16(b,at + 2,u16(v >> 16))
-private tag(b: []const u8, at: usize, s: string) -> bool
-    for i in 0usize..<4 do if b[at + i] != s[i] then return false
-    true
-private put_tag(b: []u8, at: usize, s: string)
-    for i in 0usize..<4 do b[at + i] = s[i]
-private extended(f: Format) -> bool = f.channels > 2 || f.channel_mask != 0 || f.encoding == Encoding.Pcm24 || f.encoding == Encoding.Pcm32
-header_size(f: Format) -> usize = if extended(f) then (if f.encoding == Encoding.Float32 then 80 else 68) else if f.encoding == Encoding.Float32 then 58 else 44
+
+private extended(f: Format) -> bool =
+    f.channels > 2 || f.channel_mask != 0 || f.encoding == Encoding.Pcm24 || f.encoding == Encoding.Pcm32
+
+// The `fmt ` body: 40 bytes extensible, 18 for float (WAVEFORMATEX with a zero `cbSize`), else 16.
+private fmt_size(f: Format) -> u32 =
+    if extended(f) then 40 elif f.encoding == Encoding.Float32 then 18 else 16
+
+header_size(f: Format) -> usize
+    val fact = if f.encoding == Encoding.Float32 then sizeof(Fact) else 0
+    sizeof(Riff) + sizeof(Chunk) + usize(fmt_size(f)) + fact + sizeof(Chunk)
 
 // Whether `frames` of a validated format fit the 32-bit RIFF and data lengths.
-private fits(f: Format, frames: u64) -> Result[unit,Error[never]]
-    val size = header_size(f)
-    val maximum = (0xffffffffu64 - u64(size - 8)) / u64(block_align(f))
-    if frames > maximum then return Err(Error.TooLarge)
+private fits(f: Format, frames: u64) -> Result[unit, Error[never]]
+    val overhead = u64(header_size(f) - 8)
+    if frames > (SIZE_LIMIT - overhead) / u64(block_align(f)) then return Err(Error.TooLarge)
     val bytes = frames * u64(block_align(f))
-    if u64(size - 8) + bytes + (bytes & 1) > 0xffffffff then return Err(Error.TooLarge)
+    if overhead + bytes + (bytes & 1) > SIZE_LIMIT then return Err(Error.TooLarge)
     Ok(())
 
-// Lengths are checked before touching out. Output is little-endian RIFF/WAVE;
-// float includes fact; >2 channels, channel masks and >16-bit PCM use extensible.
-header(f: Format, frames: u64, out: []u8) -> Result[usize,Error[never]]
+/** Writes the header of `frames` frames of `f` into `out` and answers its length, 44 to 80 bytes.
+ *
+ * Lengths are checked before `out` is touched. Float carries a `fact` chunk; more than two channels, a
+ * channel mask, and PCM wider than 16 bits use WAVEFORMATEXTENSIBLE.
+ */
+header(f: Format, frames: u64, out: []u8) -> Result[usize, Error[never]]
     validate(f)?
     val size = header_size(f)
     if out.len < size then return Err(Error.InvalidBuffer)
-    fits(f,frames)?
+    fits(f, frames)?
     val bytes = frames * u64(block_align(f))
-    for i in 0..<size do out[i] = 0
-    put_tag(out,0,"RIFF")
-    put32(out,4,u32(u64(size - 8) + bytes + (bytes & 1)))
-    put_tag(out,8,"WAVE")
-    put_tag(out,12,"fmt ")
     val ext = extended(f)
     val float = f.encoding == Encoding.Float32
-    val fmt_size: u32 = if ext then 40 elif float then 18 else 16
-    put32(out,16,fmt_size)
-    put16(out,20,if ext then 0xfffe elif float then 3 else 1)
-    put16(out,22,f.channels)
-    put32(out,24,f.rate)
-    put32(out,28,f.rate * block_align(f))
-    put16(out,32,u16(block_align(f)))
-    put16(out,34,u16(sample_bytes(f.encoding) * 8))
+    val bits = u16(sample_bytes(f.encoding) * 8)
+    fill(out[..<size], 0)
+
+    val riff: *Riff = at(out, 0)
+    riff.id = RIFF
+    riff.size = u32(u64(size - 8) + bytes + (bytes & 1))
+    riff.form = WAVE
+
+    val fmt: *Chunk = at(out, FMT_AT)
+    fmt.id = FMT
+    fmt.size = fmt_size(f)
+
+    val w: *WaveFormat = at(out, FORMAT_AT)
+    w.tag = if ext then TAG_EXTENSIBLE elif float then TAG_FLOAT else TAG_PCM
+    w.channels = f.channels
+    w.rate = f.rate
+    w.byte_rate = f.rate * block_align(f)
+    w.block_align = u16(block_align(f))
+    w.bits = bits
+
     if ext
-        put16(out,36,22)
-        put16(out,38,u16(sample_bytes(f.encoding) * 8))
-        put32(out,40,f.channel_mask)
-        put32(out,44,if float then 3 else 1)
-        put32(out,48,0x00100000)
-        put32(out,52,0xaa000080)
-        put32(out,56,0x719b3800)
-    var at = 20usize + usize(fmt_size)
+        val e: *Extension = at(out, EXTENSION_AT)
+        e.size = EXTENSION_BYTES
+        e.valid_bits = bits
+        e.channel_mask = f.channel_mask
+        e.sub_tag = if float then TAG_FLOAT else TAG_PCM
+        e.guid_tail = GUID_TAIL
+
+    var next = FORMAT_AT + usize(fmt_size(f))
     if float
-        put_tag(out,at,"fact")
-        put32(out,at + 4,4)
-        put32(out,at + 8,u32(frames))
-        at += 12
-    put_tag(out,at,"data")
-    put32(out,at + 4,u32(bytes))
+        val fact: *Fact = at(out, next)
+        fact.chunk.id = FACT
+        fact.chunk.size = 4
+        fact.frames = u32(frames)
+        next += sizeof(Fact)
+
+    val data: *Chunk = at(out, next)
+    data.id = DATA
+    data.size = u32(bytes)
     Ok(size)
 
 struct Info derives Eq
@@ -151,32 +251,38 @@ struct Info derives Eq
     data_bytes: u32
     frames: u64
 
+// A `fmt ` chunk of `size` bytes, whose first 40 (or all) are in `bytes`.
+//
 // The container width decides the encoding: an extensible format whose valid bits are fewer than its
 // container (24 in 32) reads as the container, and the valid-bits field is not kept.
-private parse_format(bytes: []const u8, size: u32) -> Result[Format,Error[never]]
+private parse_format(bytes: []u8, size: u32) -> Result[Format, Error[never]]
     if size < 16 then return Err(Error.InvalidFormat)
-    var code = get16(bytes,0)
-    val bits = get16(bytes,14)
-    var mask: u32 = 0
-    if code == 0xfffe
-        if size < 40 || get16(bytes,16) < 22 || u32(get16(bytes,16)) + 18 > size then return Err(Error.InvalidFormat)
-        if get16(bytes,18) > bits then return Err(Error.InvalidFormat)
-        if get16(bytes,26) != 0 || get32(bytes,28) != 0x00100000 || get32(bytes,32) != 0xaa000080 || get32(bytes,36) != 0x719b3800 then return Err(Error.Unsupported)
-        code = get16(bytes,24)
-        mask = get32(bytes,20)
+    val w: *WaveFormat = at(bytes, 0)
+    val e: *Extension = at(bytes, sizeof(WaveFormat))
+    var tag = w.tag
+    var mask = 0
+    if tag == TAG_EXTENSIBLE
+        if size < 40 || e.size < EXTENSION_BYTES || u32(e.size) + 18 > size then return Err(Error.InvalidFormat)
+        if e.valid_bits > w.bits then return Err(Error.InvalidFormat)
+        if e.guid_tail != GUID_TAIL then return Err(Error.Unsupported)
+        tag = e.sub_tag
+        mask = e.channel_mask
     elif size != 16
-        if size < 18 || u32(get16(bytes,16)) + 18 > size then return Err(Error.InvalidFormat)
-    val encoding = if code == 1 then bits match
+        if size < 18 || u32(e.size) + 18 > size then return Err(Error.InvalidFormat)
+
+    val encoding = if tag == TAG_PCM then w.bits match
         8 -> Encoding.Pcm8
         16 -> Encoding.Pcm16
         24 -> Encoding.Pcm24
         32 -> Encoding.Pcm32
         _ -> return Err(Error.Unsupported)
-    elif code == 3 && bits == 32 then Encoding.Float32
+    elif tag == TAG_FLOAT && w.bits == 32 then Encoding.Float32
     else return Err(Error.Unsupported)
-    val f = format(get32(bytes,4),get16(bytes,2),encoding,mask)
+
+    val f = format(w.rate, w.channels, encoding, mask)
     validate(f)?
-    if get16(bytes,12) != u16(block_align(f)) || get32(bytes,8) != f.rate * block_align(f) then return Err(Error.InvalidFormat)
+    if w.block_align != u16(block_align(f)) || w.byte_rate != f.rate * block_align(f)
+        return Err(Error.InvalidFormat)
     Ok(f)
 
 /** Finds the format and the data of a RIFF/WAVE in `s`.
@@ -186,109 +292,120 @@ private parse_format(bytes: []const u8, size: u32) -> Result[Format,Error[never]
  * unfinalised file, runs to the end with a partial last frame dropped; and a final odd chunk missing
  * its pad byte is accepted. A chunk that claims bytes the store does not have is `Truncated`.
  */
-inspect[S: ReadAt](s: *S) -> Result[Info,Error[S::Error]]
+inspect[S: ReadAt](s: *S) -> Result[Info, Error[S::Error]]
     val length = s.extent()?
-    if length < 12 then return Err(Error.Truncated)
+    if length < sizeof(Riff) then return Err(Error.Truncated)
     var start: [12]u8
-    read_all(s,0,start[..])?
-    if !tag(start[..],0,"RIFF") || !tag(start[..],8,"WAVE") then return Err(Error.BadContainer)
-    val declared = get32(start[..],4)
-    val unfinalised = declared == 0 || declared == 0xffffffff
+    read_all(s, 0, start[..])?
+    val riff: *Riff = at(start[..], 0)
+    if riff.id != RIFF || riff.form != WAVE then return Err(Error.BadContainer)
+    val unfinalised = riff.size == 0 || riff.size == UNSIZED
     var end = length
-    if !unfinalised && 8u64 + u64(declared) < length then end = 8u64 + u64(declared)
-    if end < 12 then return Err(Error.BadContainer)
-    var pos: u64 = 12
+    if !unfinalised && 8 + u64(riff.size) < length then end = 8 + u64(riff.size)
+    if end < sizeof(Riff) then return Err(Error.BadContainer)
+
+    var pos = u64(sizeof(Riff))
     var found: Option[Format] = None
-    var data: Option[(u64,u64)] = None
+    var data: Option[(u64, u64)] = None
     var open = false
-    while pos < end
-        if end - pos < 8 then break
-        var chunk: [8]u8
-        read_all(s,pos,chunk[..])?
-        var size = u64(get32(chunk[..],4))
+    while end - pos >= sizeof(Chunk)
+        var head: [8]u8
+        read_all(s, pos, head[..])?
+        val chunk: *Chunk = at(head[..], 0)
+        var size = u64(chunk.size)
         val body = pos + 8
-        val is_data = tag(chunk[..],0,"data")
-        if is_data && (size == 0xffffffff || (size == 0 && unfinalised))
-            size = if end - body > 0xffffffffu64 then 0xffffffffu64 else end - body
+        val is_data = chunk.id == DATA
+        if is_data && (chunk.size == UNSIZED || (size == 0 && unfinalised))
+            size = min(end - body, SIZE_LIMIT)
             open = true
         if body + size > end then return Err(Error.Truncated)
-        val next = if body + size + (size & 1) > end then end else body + size + (size & 1)
-        if tag(chunk[..],0,"fmt ")
-            if found.is_some() then return Err(Error.InvalidFormat)
-            if size < 16 then return Err(Error.InvalidFormat)
-            var bytes: [40]u8 = [0;40]
-            val take = if size > 40 then 40usize else usize(size)
-            read_all(s,body,bytes[..<take])?
-            found = Some(parse_format(bytes[..],u32(size))?)
+        if chunk.id == FMT
+            if found.is_some() || size < 16 then return Err(Error.InvalidFormat)
+            var bytes: [40]u8 = [0; 40]
+            read_all(s, body, bytes[..<usize(min(size, 40))])?
+            found = Some(parse_format(bytes[..], u32(size))?)
         elif is_data
             if data.is_some() then return Err(Error.InvalidFormat)
-            data = Some((body,size))
-        pos = next
+            data = Some((body, size))
+        pos = min(body + size + (size & 1), end)
+    end while
+
     val f = found match
         Some(f) -> f
         None -> return Err(Error.InvalidFormat)
-    val (offset,declared_size) = data match
+    val (offset, declared) = data match
         Some(d) -> d
         None -> return Err(Error.InvalidFormat)
     val align = u64(block_align(f))
-    val size = if open then declared_size - declared_size % align else declared_size
+    val size = if open then declared - declared % align else declared
     if size % align != 0 then return Err(Error.InvalidFormat)
-    Ok(Info(f,offset,u32(size),size / align))
+    Ok(Info(f, offset, u32(size), size / align))
 
 /** Frame-by-frame reading of the data chunk of `store`, which the reader holds for its life. */
 struct Reader[S: ReadAt]
     info: Info
     private store: *S
     private frame: u64
-reader[S: ReadAt](store: *S) -> Result[Reader[S],Error[S::Error]] = Ok(Reader(inspect(store)?,store,0))
+
+reader[S: ReadAt](store: *S) -> Result[Reader[S], Error[S::Error]] = Ok(Reader(inspect(store)?, store, 0))
+
 impl[S: ReadAt] Reader[S]
-    seek_frame(*self, frame: u64) -> Result[unit,Error[never]]
+    seek_frame(*self, frame: u64) -> Result[unit, Error[never]]
         if frame > self.info.frames then return Err(Error.OutOfRange)
         self.frame = frame
         Ok(())
-    read(*self, out: []u8) -> Result[usize,Error[S::Error]]
+
+    read(*self, out: []u8) -> Result[usize, Error[S::Error]]
         val align = usize(block_align(self.info.format))
         if out.len % align != 0 then return Err(Error.InvalidBuffer)
         val remaining = (self.info.frames - self.frame) * u64(align)
-        val take = if remaining < u64(out.len) then usize(remaining) else out.len
-        read_all(self.store,self.info.data_offset + self.frame * u64(align),out[..<take])?
+        val take = usize(min(remaining, u64(out.len)))
+        read_all(self.store, self.info.data_offset + self.frame * u64(align), out[..<take])?
         self.frame += u64(take / align)
         Ok(take)
 
 /** Streaming writing of one WAV to `store`, which the writer holds until `finish`. */
 struct Writer[S: WriteAt]
-    private store: *S
-    private format: Format
-    private bytes: u32
-    private failed: bool
-    private closed: bool
-writer[S: WriteAt](store: *S, f: Format) -> Result[Writer[S],Error[S::Error]]
-    var bytes: [80]u8
-    val count = header(f,0,bytes[..])?
-    write_all_at(store,0,bytes[..<count])?
-    Ok(Writer(store,f,0,false,false))
+    private[wav] store: *S
+    private[wav] format: Format
+    private[wav] bytes: u32
+    private[wav] failed: bool
+    private[wav] closed: bool
+
+// The longest header `header` writes: extensible float, with its `fact` chunk.
+private const MAX_HEADER: usize = 80
+
+writer[S: WriteAt](store: *S, f: Format) -> Result[Writer[S], Error[S::Error]]
+    var bytes: [MAX_HEADER]u8
+    val count = header(f, 0, bytes[..])?
+    write_all_at(store, 0, bytes[..<count])?
+    Ok(Writer(store, f, 0, false, false))
+
 impl[S: WriteAt] Writer[S]
     frames(*self) -> u64 = u64(self.bytes / block_align(self.format))
-    append(*self, data: []const u8) -> Result[unit,Error[S::Error]]
+
+    append(*self, data: []const u8) -> Result[unit, Error[S::Error]]
         if self.failed || self.closed then return Err(Error.State)
-        if data.len % usize(block_align(self.format)) != 0 then return Err(Error.InvalidBuffer)
+        val align = block_align(self.format)
+        if data.len % usize(align) != 0 then return Err(Error.InvalidBuffer)
         val count = u64(self.bytes) + u64(data.len)
-        fits(self.format,count / u64(block_align(self.format)))?
-        val put = write_all_at(self.store,u64(header_size(self.format)) + u64(self.bytes),data)
+        fits(self.format, count / u64(align))?
+        val put = write_all_at(self.store, u64(header_size(self.format)) + u64(self.bytes), data)
         if put.is_err() then self.failed = true
         put?
         self.bytes = u32(count)
         Ok(())
-    finish(*self) -> Result[unit,Error[S::Error]]
+
+    finish(*self) -> Result[unit, Error[S::Error]]
         if self.failed then return Err(Error.State)
         if self.closed then return Ok(())
         self.failed = true
-        var bytes: [80]u8
-        val count = header(self.format,self.frames(),bytes[..])?
+        var bytes: [MAX_HEADER]u8
+        val count = header(self.format, self.frames(), bytes[..])?
         if self.bytes & 1 != 0
             val pad: [1]u8 = [0]
-            write_all_at(self.store,u64(count) + u64(self.bytes),pad[..])?
-        write_all_at(self.store,0,bytes[..<count])?
+            write_all_at(self.store, u64(count) + u64(self.bytes), pad[..])?
+        write_all_at(self.store, 0, bytes[..<count])?
         self.store.sync()?
         self.failed = false
         self.closed = true

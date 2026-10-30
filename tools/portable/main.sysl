@@ -1,24 +1,34 @@
 @no_alloc
 import sh.sysl.wav.*
 import sysl.io.*
+import sysl.slices.{as_mut_ptr, as_ptr}
+
 extern "wav_probe_read" probe_read(offset: u64, out: *u8, count: usize) -> usize
 extern "wav_probe_write" probe_write(offset: u64, bytes: *u8, count: usize) -> usize
+
 enum PortError
     Dead
+
 struct Port
 end Port
+
 impl Positioned for Port
     type Error = PortError
-    extent(*self) -> Result[u64,PortError] = Ok(1024)
+    extent(*self) -> Result[u64, PortError] = Ok(1024)
+
 impl ReadAt for Port
-    read_at(*self, offset: u64, out: []u8) -> Result[[]const u8,PortError] = Ok(out[..<probe_read(offset,&out[0],out.len)])
+    read_at(*self, offset: u64, out: []u8) -> Result[[]const u8, PortError] =
+        Ok(out[..<probe_read(offset, as_mut_ptr(out), out.len)])
+
 impl WriteAt for Port
-    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize,PortError] = Ok(probe_write(offset,&bytes[0],bytes.len))
+    write_at(*self, offset: u64, bytes: []const u8) -> Result[usize, PortError] =
+        Ok(probe_write(offset, as_ptr(bytes), bytes.len))
+
 @export("wav_probe")
 probe() -> int
     var p = Port()
-    var w = writer(&p,format(48000,2,Encoding.Pcm16)).unwrap()
-    var bytes: [16]u8 = [0;16]
+    var w = writer(&p, format(48000, 2, Encoding.Pcm16)).unwrap()
+    var bytes: [16]u8 = [0; 16]
     w.append(bytes[..]).unwrap()
     w.finish().unwrap()
     var r = reader(&p).unwrap()

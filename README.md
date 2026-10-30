@@ -25,7 +25,8 @@ integer/float conversion or codec decoding is implied.
 
 ```sysl
 import sh.sysl.wav as wav
-var output = wav.writer(&store,wav.format(48000,2,wav.Encoding.Pcm16)).unwrap()
+
+var output = wav.writer(&store, wav.format(48000, 2, wav.Encoding.Pcm16)).unwrap()
 output.append(interleaved_pcm_bytes).unwrap()
 output.finish().unwrap()
 ```
@@ -40,12 +41,19 @@ and caller-owned payloads.
 
 ```hocon
 dependencies {
-  wav { git = "github.com/sysl-lang/wav", version = "0.1.0" }
+  wav { git = "github.com/sysl-lang/wav", version = "0.1.2" }
 }
 ```
 
-Needs sysl 0.7.6. Run `scripts/gate.sh`: the tests, and instantiated builds for
+Needs sysl 0.8.6. Run `scripts/gate.sh`: the tests, and instantiated builds for
 five freestanding targets. Compile probes do not execute on physical hardware.
+
+The tests check wav against files it did not write: `sh/sysl/wav/fixtures/`
+holds WAVs made by afconvert (macOS), sox and ffmpeg from the sample text in
+`stereo.dat` and `six.dat`, and `scripts/fixtures.sh` regenerates them. wav
+must read each with the format, frame count and data offset `afinfo` reports,
+the three tools' conversions of one source must read back as the same samples,
+and a file wav writes must equal ffmpeg's or sox's byte for byte.
 
 References: [Microsoft WAVEFORMATEXTENSIBLE](https://learn.microsoft.com/en-us/windows/win32/api/mmreg/ns-mmreg-waveformatextensible)
 and [Microsoft wave formats](https://github.com/microsoft/DirectXTK/wiki/Wave-Formats).
